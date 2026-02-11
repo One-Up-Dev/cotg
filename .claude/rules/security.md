@@ -1,4 +1,4 @@
-# Security Rules — COTO
+# Security Rules — COTG
 
 ## Prompt Injection Defense
 

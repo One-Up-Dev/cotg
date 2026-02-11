@@ -1,8 +1,8 @@
-# COTO — Claude On The Go
+# COTG — Claude On The Go
 
 Access [Claude Code](https://docs.anthropic.com/en/docs/claude-code) from anywhere, 24/7, through Telegram.
 
-COTO is a lightweight bridge between Telegram and the Claude CLI (`claude -p`). Send a message on Telegram, get a Claude Code response — from your phone, tablet, or any device.
+COTG is a lightweight bridge between Telegram and the Claude CLI (`claude -p`). Send a message on Telegram, get a Claude Code response — from your phone, tablet, or any device.
 
 ## Features
 
@@ -36,8 +36,8 @@ Telegram → bot.py → claude_runner.py → claude -p → response → formatti
 ## Installation
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/coto.git
-cd coto
+git clone https://github.com/oneup/cotg.git
+cd cotg
 
 python3 -m venv .venv
 source .venv/bin/activate
