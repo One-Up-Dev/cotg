@@ -36,7 +36,7 @@ Telegram → bot.py → claude_runner.py → claude -p → response → formatti
 ## Installation
 
 ```bash
-git clone https://github.com/oneup/cotg.git
+git clone https://github.com/<your-username>/cotg.git
 cd cotg
 
 python3 -m venv .venv
