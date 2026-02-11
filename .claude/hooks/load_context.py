@@ -12,7 +12,7 @@ from pathlib import Path
 
 DB_PATH = str(Path(__file__).resolve().parent.parent.parent / "database.db")
 MESSAGE_LIMIT = 30
-CONTENT_MAX_LEN = 800
+CONTENT_MAX_LEN = 2000
 
 
 def get_recent_messages(limit=MESSAGE_LIMIT):

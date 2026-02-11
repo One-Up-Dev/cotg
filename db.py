@@ -10,7 +10,7 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 DB_PATH = str(Path(__file__).resolve().parent / "database.db")
-DEDUP_WINDOW_SECONDS = 5
+DEDUP_WINDOW_SECONDS = 60
 MAX_MESSAGES = 5000
 
 
@@ -27,12 +27,21 @@ def _init_db(conn):
             role TEXT NOT NULL,
             content TEXT NOT NULL,
             metadata TEXT,
-            source TEXT DEFAULT 'claude-code'
+            source TEXT DEFAULT 'claude-code',
+            content_hash TEXT
         )
     """)
+    # Add content_hash column if missing (migration)
+    try:
+        conn.execute("ALTER TABLE messages ADD COLUMN content_hash TEXT")
+    except sqlite3.OperationalError:
+        pass  # Column already exists
     conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_source ON messages (source)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_role ON messages (role)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_id_desc ON messages (id DESC)")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_messages_hash ON messages (role, content_hash)"
+    )
     conn.commit()
 
 
@@ -40,25 +49,24 @@ def _content_hash(text):
     return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
 
 
-def _is_duplicate(conn, role, c_hash, source, now_iso):
-    """Check if a message with the same hash was saved within the dedup window."""
+def _is_duplicate(conn, role, c_hash):
+    """Check if a message with the same hash exists in the dedup window."""
     row = conn.execute(
         """SELECT metadata FROM messages
-           WHERE role = ? AND source = ?
+           WHERE role = ?
+             AND (content_hash = ? OR json_extract(metadata, '$.content_hash') = ?)
            ORDER BY id DESC LIMIT 1""",
-        (role, source),
+        (role, c_hash, c_hash),
     ).fetchone()
     if not row or not row[0]:
         return False
     try:
         meta = json.loads(row[0])
-        if meta.get("content_hash", "") != c_hash:
-            return False
         last_time = meta.get("created_at", "")
         if not last_time:
             return False
         last_dt = datetime.fromisoformat(last_time.replace("Z", "+00:00"))
-        now_dt = datetime.fromisoformat(now_iso.replace("Z", "+00:00"))
+        now_dt = datetime.now(timezone.utc)
         return abs((now_dt - last_dt).total_seconds()) < DEDUP_WINDOW_SECONDS
     except (json.JSONDecodeError, ValueError):
         return False
@@ -70,21 +78,22 @@ def save_message(role, content, source="claude-code", session_id=""):
         return
     try:
         conn = get_connection()
-        now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
         c_hash = _content_hash(content)
 
-        if _is_duplicate(conn, role, c_hash, source, now):
+        if _is_duplicate(conn, role, c_hash):
             conn.close()
             return
 
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
         metadata = json.dumps({
             "session_id": session_id,
             "created_at": now,
             "content_hash": c_hash,
         })
         conn.execute(
-            "INSERT INTO messages (role, content, metadata, source) VALUES (?, ?, ?, ?)",
-            (role, content, metadata, source),
+            "INSERT INTO messages (role, content, metadata, source, content_hash) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (role, content, metadata, source, c_hash),
         )
         conn.commit()
         _maybe_rotate(conn)

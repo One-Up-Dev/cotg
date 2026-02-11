@@ -37,8 +37,9 @@ def main():
 
 
 def _save_from_transcript(session_id, transcript_path):
-    """Fallback: extract assistant messages from JSONL transcript."""
+    """Fallback: extract the LAST assistant message from JSONL transcript."""
     try:
+        last_text = None
         with open(transcript_path, "r") as f:
             for line in f:
                 line = line.strip()
@@ -56,10 +57,11 @@ def _save_from_transcript(session_id, transcript_path):
                             elif isinstance(part, dict) and part.get("type") == "text":
                                 text_parts.append(part.get("text", ""))
                         if text_parts:
-                            full_text = "\n".join(text_parts)
-                            save_message("assistant", full_text, source="claude-code", session_id=session_id)
+                            last_text = "\n".join(text_parts)
                 except json.JSONDecodeError:
                     continue
+        if last_text:
+            save_message("assistant", last_text, source="claude-code", session_id=session_id)
     except (IOError, OSError):
         pass
 
