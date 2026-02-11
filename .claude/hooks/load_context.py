@@ -1,10 +1,7 @@
 #!/usr/bin/env python3
 """Load recent messages from database into Claude's context on session start.
 
-Features:
-- Loads last N messages across all sources (claude-code, telegram, etc.)
-- Shows source tag for multi-source context
-- Smart truncation with configurable limit
+Runs as a SessionStart hook — loads once per session, not on every prompt.
 """
 
 import json
@@ -69,7 +66,10 @@ def main():
 
     output = {"continue": True}
     if context:
-        output["message"] = context
+        output["hookSpecificOutput"] = {
+            "hookEventName": "SessionStart",
+            "additionalContext": context,
+        }
 
     json.dump(output, sys.stdout)
 

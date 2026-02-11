@@ -15,6 +15,7 @@ from telegram.ext import (
 
 from claude_runner import run_claude
 from config import Config
+from db import save_message
 from formatting import (
     format_response,
     is_plain_text,
@@ -71,6 +72,7 @@ async def handle_message(update: Update, context) -> None:
     config: Config = context.bot_data["config"]
 
     logger.info("Message received from chat_id=%d (%d chars)", chat_id, len(user_text))
+    save_message("user", user_text, source="telegram")
 
     # Start typing indicator
     stop_typing = asyncio.Event()
@@ -98,6 +100,7 @@ async def handle_message(update: Update, context) -> None:
         await typing_task
 
     logger.info("Claude responded (%d chars)", len(response))
+    save_message("assistant", response, source="telegram")
 
     chunks = await format_response(response, config.max_message_length)
     await send_chunks(update, chunks)
