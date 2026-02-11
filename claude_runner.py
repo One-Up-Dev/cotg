@@ -27,7 +27,6 @@ async def run_claude(message: str, config: Config) -> str:
     cmd = [
         config.claude_bin,
         "-p", message,
-        "-c",
         "--output-format", "json",
     ]
 

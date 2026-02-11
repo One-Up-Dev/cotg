@@ -53,10 +53,9 @@ def _is_duplicate(conn, role, c_hash):
     """Check if a message with the same hash exists in the dedup window."""
     row = conn.execute(
         """SELECT metadata FROM messages
-           WHERE role = ?
-             AND (content_hash = ? OR json_extract(metadata, '$.content_hash') = ?)
+           WHERE role = ? AND content_hash = ?
            ORDER BY id DESC LIMIT 1""",
-        (role, c_hash, c_hash),
+        (role, c_hash),
     ).fetchone()
     if not row or not row[0]:
         return False
