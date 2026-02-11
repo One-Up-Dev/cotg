@@ -4,3 +4,4 @@ __pycache__/
 *.pyc
 database.db
 .claude/settings.json
+TASKS.md
