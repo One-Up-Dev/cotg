@@ -1,15 +1,21 @@
 #!/usr/bin/env python3
-"""Load recent messages from database into Claude's context on session start.
+"""Load multi-layer memory into Claude's context on session start.
 
 Runs as a SessionStart hook — loads once per session, not on every prompt.
 
-Applies several optimizations:
-1. Cross-source dedup: when CC and TG have same assistant response, keep TG only
-2. Short message filtering: skip low-value messages (< 15 chars)
-3. Compact assistant summaries: truncate long assistant messages, keep user messages full
-4. Smart truncation: cut at last section boundary instead of mid-sentence
-5. Temporal coverage: use token budget to cover more time, not just last N messages
-6. Session separators: group messages by time gaps
+Memory layers injected:
+1. Long-term memory: persistent facts and preferences (table: facts)
+2. Medium-term memory: recent session summaries (table: summaries)
+3. Active tasks: pending/in-progress tasks (table: tasks)
+4. Short-term memory: recent conversation messages (table: messages)
+
+Optimizations on message history:
+- Cross-source dedup: when CC and TG have same assistant response, keep TG only
+- Short message filtering: skip low-value messages (< 15 chars)
+- Compact assistant summaries: truncate long assistant messages, keep user messages full
+- Smart truncation: cut at last section boundary instead of mid-sentence
+- Token budget: cover more time, not just last N messages
+- Session separators: group messages by time gaps
 """
 
 import json
@@ -20,15 +26,23 @@ from datetime import datetime
 from pathlib import Path
 
 DB_PATH = str(Path(__file__).resolve().parent.parent.parent / "database.db")
-TOKEN_BUDGET = 4000  # ~4000 tokens worth of context
-CHARS_PER_TOKEN = 4  # rough estimate
-CHAR_BUDGET = TOKEN_BUDGET * CHARS_PER_TOKEN
-FETCH_LIMIT = 120  # fetch more raw messages to have wider temporal window
-SHORT_MSG_THRESHOLD = 15  # chars — skip user messages shorter than this
-ASSISTANT_MAX_LEN = 800  # compact assistant messages more aggressively
-USER_MAX_LEN = 2000  # keep user messages longer (they contain decisions)
-SESSION_GAP_MINUTES = 30  # gap between messages to insert session separator
 
+# Token budgets per memory layer
+TOTAL_TOKEN_BUDGET = 6000
+FACTS_TOKEN_BUDGET = 500       # ~2000 chars — persistent facts
+SUMMARIES_TOKEN_BUDGET = 1000  # ~4000 chars — session summaries
+TASKS_TOKEN_BUDGET = 500       # ~2000 chars — active tasks
+# Remaining goes to conversation history
+CHARS_PER_TOKEN = 4
+
+FETCH_LIMIT = 120
+SHORT_MSG_THRESHOLD = 15
+ASSISTANT_MAX_LEN = 800
+USER_MAX_LEN = 2000
+SESSION_GAP_MINUTES = 30
+
+
+# ── Message history (short-term) ─────────────────────────────────────
 
 def get_recent_messages():
     if not os.path.exists(DB_PATH):
@@ -48,7 +62,6 @@ def get_recent_messages():
 
 
 def dedup_consecutive(rows):
-    """Remove consecutive messages with the same content hash."""
     result = []
     prev_hash = None
     for row in rows:
@@ -61,30 +74,23 @@ def dedup_consecutive(rows):
 
 
 def dedup_cross_source(rows):
-    """When CC and TG have similar assistant messages close together, keep TG only.
-
-    Pattern: CC saves the raw response, TG saves the formatted version sent to user.
-    The TG version is more relevant (it's what the user actually saw).
-    """
+    """When CC and TG have similar assistant messages close together, keep TG only."""
     to_remove = set()
     for i, row in enumerate(rows):
         role, content, _meta, source, _hash, msg_id = row
         if role != "assistant" or source != "claude-code":
             continue
-        # Look for a nearby TG assistant message (within 3 positions)
         for j in range(max(0, i - 3), min(len(rows), i + 4)):
             if j == i:
                 continue
             other = rows[j]
             if other[0] == "assistant" and other[3] == "telegram":
-                # CC message near a TG message — CC is likely the intermediate/raw version
                 to_remove.add(i)
                 break
     return [row for i, row in enumerate(rows) if i not in to_remove]
 
 
 def filter_short_messages(rows):
-    """Remove short user messages with low contextual value."""
     return [
         row for row in rows
         if not (row[0] == "user" and len(row[1].strip()) < SHORT_MSG_THRESHOLD)
@@ -92,30 +98,21 @@ def filter_short_messages(rows):
 
 
 def smart_truncate(content, max_len):
-    """Truncate at a section boundary (##, ---, blank line) instead of mid-text."""
     if len(content) <= max_len:
         return content
-
-    # Try to find a good break point near the limit
     search_zone = content[max_len // 2:max_len]
-
-    # Look for section boundaries (in reverse order of preference)
     for marker in ["\n## ", "\n---", "\n\n"]:
         pos = search_zone.rfind(marker)
         if pos != -1:
             cut = max_len // 2 + pos
             return content[:cut] + "\n[...]"
-
-    # Fallback: cut at last sentence end
     last_period = content[:max_len].rfind(". ")
     if last_period > max_len // 2:
         return content[:last_period + 1] + " [...]"
-
     return content[:max_len] + "..."
 
 
 def parse_timestamp(metadata):
-    """Extract datetime from metadata."""
     if not metadata:
         return None
     try:
@@ -129,21 +126,126 @@ def parse_timestamp(metadata):
 
 
 def format_source(source):
-    labels = {
-        "claude-code": "CC",
-        "telegram": "TG",
-        "web": "WEB",
-    }
+    labels = {"claude-code": "CC", "telegram": "TG", "web": "WEB"}
     return labels.get(source, source or "CC")
 
 
-def build_context(rows):
-    """Build context string with session separators and token budget.
+# ── Memory layers (medium/long-term) ─────────────────────────────────
 
-    Strategy: fill from most recent first to guarantee recent context,
-    then prepend older messages until budget is exhausted.
-    """
-    # Build formatted entries from most recent to oldest
+def get_facts():
+    """Load persistent facts from DB."""
+    if not os.path.exists(DB_PATH):
+        return []
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        # Check if table exists
+        table = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='facts'"
+        ).fetchone()
+        if not table:
+            conn.close()
+            return []
+        rows = conn.execute(
+            "SELECT category, content FROM facts WHERE active = 1 ORDER BY category, id"
+        ).fetchall()
+        conn.close()
+        return rows
+    except (sqlite3.DatabaseError, sqlite3.OperationalError):
+        return []
+
+
+def get_summaries(limit=5):
+    """Load recent session summaries from DB."""
+    if not os.path.exists(DB_PATH):
+        return []
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        table = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='summaries'"
+        ).fetchone()
+        if not table:
+            conn.close()
+            return []
+        rows = conn.execute(
+            "SELECT summary, decisions, files_modified, created_at "
+            "FROM summaries ORDER BY id DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        conn.close()
+        return list(reversed(rows))
+    except (sqlite3.DatabaseError, sqlite3.OperationalError):
+        return []
+
+
+def get_tasks():
+    """Load active tasks from DB."""
+    if not os.path.exists(DB_PATH):
+        return []
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        table = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='memory_tasks'"
+        ).fetchone()
+        if not table:
+            conn.close()
+            return []
+        rows = conn.execute(
+            "SELECT title, status, context, updated_at FROM memory_tasks "
+            "WHERE status != 'done' ORDER BY id"
+        ).fetchall()
+        conn.close()
+        return rows
+    except (sqlite3.DatabaseError, sqlite3.OperationalError):
+        return []
+
+
+# ── Context builders ──────────────────────────────────────────────────
+
+def build_facts_context(facts):
+    """Format facts into context block."""
+    if not facts:
+        return ""
+    lines = ["[Long-term memory — persistent facts]"]
+    current_cat = None
+    for category, content in facts:
+        if category != current_cat:
+            current_cat = category
+            lines.append(f"  [{category}]")
+        lines.append(f"  - {content}")
+    return "\n".join(lines)
+
+
+def build_summaries_context(summaries):
+    """Format session summaries into context block."""
+    if not summaries:
+        return ""
+    lines = ["[Medium-term memory — recent session summaries]"]
+    for summary, decisions, files_modified, created_at in summaries:
+        date = created_at[:10] if created_at else "?"
+        lines.append(f"  [{date}] {summary}")
+        if files_modified:
+            lines.append(f"    Files: {files_modified}")
+        if decisions:
+            lines.append(f"    Decisions: {decisions[:200]}")
+    return "\n".join(lines)
+
+
+def build_tasks_context(tasks):
+    """Format active tasks into context block."""
+    if not tasks:
+        return ""
+    lines = ["[Active tasks]"]
+    for title, status, context, updated_at in tasks:
+        icon = {"pending": "[ ]", "in_progress": "[>]", "blocked": "[!]"}.get(status, "[ ]")
+        line = f"  {icon} {title}"
+        if context:
+            line += f" — {context[:100]}"
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def build_messages_context(rows, char_budget):
+    """Build conversation history within the given char budget."""
     entries = []
     total_chars = 0
 
@@ -154,34 +256,18 @@ def build_context(rows):
         src = format_source(source)
         prefix = "Oneup" if role == "user" else os.environ.get("ASSISTANT_NAME", "Nova")
 
-        # Fix #3 + #4: Smart truncation with role-based limits
         max_len = USER_MAX_LEN if role == "user" else ASSISTANT_MAX_LEN
         content = smart_truncate(content, max_len)
-
         line = f"[{created}][{src}] {prefix}: {content}"
 
-        # Fix #5: Token budget — stop adding when budget exhausted
-        if total_chars + len(line) > CHAR_BUDGET:
+        if total_chars + len(line) > char_budget:
             break
         total_chars += len(line)
         entries.append((line, metadata))
 
-    # Reverse back to chronological order
     entries.reverse()
 
-    # Fix #6: Insert session separators based on time gaps
-    assistant_name = os.environ.get("ASSISTANT_NAME", "Nova")
-    lines = [
-        "[Conversation history from previous sessions]",
-        "",
-        "",
-        "",
-        f"IMPORTANT: This is a CONTINUING conversation. Do NOT greet the user again "
-        f"(no 'Salut', 'Bonjour', etc.) — you already know each other. "
-        f"Do NOT re-examine code or state you already checked in recent history. "
-        f"Pick up naturally where the conversation left off.",
-        "",
-    ]
+    lines = []
     prev_time = None
     for line, metadata in entries:
         curr_time = parse_timestamp(metadata)
@@ -192,26 +278,72 @@ def build_context(rows):
         prev_time = curr_time
         lines.append(line)
 
-    lines.append("[End of history]")
     return "\n\n".join(lines)
+
+
+# ── Main assembly ─────────────────────────────────────────────────────
+
+def build_full_context(rows, facts, summaries, tasks):
+    """Assemble all memory layers into a single context string."""
+    sections = []
+
+    # Layer 1: Long-term facts
+    facts_ctx = build_facts_context(facts)
+    if facts_ctx:
+        sections.append(facts_ctx)
+
+    # Layer 2: Session summaries (medium-term)
+    summaries_ctx = build_summaries_context(summaries)
+    if summaries_ctx:
+        sections.append(summaries_ctx)
+
+    # Layer 3: Active tasks
+    tasks_ctx = build_tasks_context(tasks)
+    if tasks_ctx:
+        sections.append(tasks_ctx)
+
+    # Layer 4: Conversation history (short-term)
+    # Calculate remaining budget for messages
+    used_chars = sum(len(s) for s in sections)
+    messages_budget = (TOTAL_TOKEN_BUDGET * CHARS_PER_TOKEN) - used_chars
+    messages_budget = max(messages_budget, 8000)  # minimum 8000 chars for messages
+
+    if rows:
+        messages_ctx = build_messages_context(rows, messages_budget)
+        if messages_ctx:
+            sections.append(messages_ctx)
+
+    if not sections:
+        return ""
+
+    # Wrap with instructions
+    header = (
+        "[Conversation history from previous sessions]\n\n\n\n"
+        "IMPORTANT: This is a CONTINUING conversation. Do NOT greet the user again "
+        "(no 'Salut', 'Bonjour', etc.) — you already know each other. "
+        "Do NOT re-examine code or state you already checked in recent history. "
+        "Pick up naturally where the conversation left off.\n"
+    )
+    footer = "\n[End of history]"
+
+    return header + "\n\n".join(sections) + footer
 
 
 def main():
     json.load(sys.stdin)  # consume stdin (required by hook protocol)
 
+    # Load all memory layers
     rows = get_recent_messages()
+    facts = get_facts()
+    summaries = get_summaries(limit=5)
+    tasks = get_tasks()
 
     if rows:
-        # Fix #1: Dedup consecutive same-hash messages
         rows = dedup_consecutive(rows)
-        # Fix #1b: Dedup cross-source CC+TG assistant messages
         rows = dedup_cross_source(rows)
-        # Fix #2: Filter short user messages
         rows = filter_short_messages(rows)
 
-        context = build_context(rows)
-    else:
-        context = ""
+    context = build_full_context(rows, facts, summaries, tasks)
 
     output = {"continue": True}
     if context:

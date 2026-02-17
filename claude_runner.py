@@ -7,6 +7,7 @@ import os
 from collections.abc import AsyncGenerator
 
 from config import Config
+from db import get_active_facts, get_active_tasks, get_recent_summaries
 
 logger = logging.getLogger(__name__)
 
@@ -19,6 +20,44 @@ def _claude_env() -> dict[str, str]:
     os.makedirs(tmpdir, exist_ok=True)
     env["TMPDIR"] = tmpdir
     return env
+
+
+def _build_memory_context() -> str:
+    """Build memory context string from DB for injection into system prompt."""
+    sections = []
+
+    # Long-term facts
+    facts = get_active_facts()
+    if facts:
+        lines = ["[Long-term memory]"]
+        for category, content in facts:
+            lines.append(f"  [{category}] {content}")
+        sections.append("\n".join(lines))
+
+    # Recent session summaries
+    summaries = get_recent_summaries(limit=3)
+    if summaries:
+        lines = ["[Recent sessions]"]
+        for summary, decisions, files_modified, created_at in summaries:
+            date = created_at[:10] if created_at else "?"
+            lines.append(f"  [{date}] {summary[:200]}")
+            if files_modified:
+                lines.append(f"    Files: {files_modified}")
+        sections.append("\n".join(lines))
+
+    # Active tasks
+    tasks = get_active_tasks()
+    if tasks:
+        lines = ["[Active tasks]"]
+        icons = {"pending": "[ ]", "in_progress": "[>]", "blocked": "[!]"}
+        for title, status, context, _ in tasks:
+            icon = icons.get(status, "[ ]")
+            lines.append(f"  {icon} {title}")
+        sections.append("\n".join(lines))
+
+    if not sections:
+        return ""
+    return "\n\n".join(sections)
 
 
 async def run_claude(message: str, config: Config) -> str:
@@ -35,13 +74,18 @@ async def run_claude(message: str, config: Config) -> str:
         TimeoutError: If claude takes longer than config.claude_timeout.
         RuntimeError: If claude exits with non-zero code or empty response.
     """
+    memory = _build_memory_context()
+    system = config.system_prompt
+    if memory:
+        system = f"{system}\n\n{memory}"
+
     cmd = [
         config.claude_bin,
         "-p", message,
         "--output-format", "json",
         "--dangerously-skip-permissions",
         "--model", "opus",
-        "--append-system-prompt", config.system_prompt,
+        "--append-system-prompt", system,
     ]
 
     process = await asyncio.create_subprocess_exec(
@@ -103,6 +147,11 @@ async def stream_claude(message: str, config: Config) -> AsyncGenerator[str | No
         TimeoutError: If no output received for config.claude_timeout seconds.
         RuntimeError: If claude exits with non-zero code.
     """
+    memory = _build_memory_context()
+    system = config.system_prompt
+    if memory:
+        system = f"{system}\n\n{memory}"
+
     cmd = [
         config.claude_bin,
         "-p", message,
@@ -111,7 +160,7 @@ async def stream_claude(message: str, config: Config) -> AsyncGenerator[str | No
         "--include-partial-messages",
         "--dangerously-skip-permissions",
         "--model", "opus",
-        "--append-system-prompt", config.system_prompt,
+        "--append-system-prompt", system,
     ]
 
     process = await asyncio.create_subprocess_exec(
