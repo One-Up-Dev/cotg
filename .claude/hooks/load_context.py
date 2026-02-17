@@ -170,13 +170,16 @@ def build_context(rows):
     entries.reverse()
 
     # Fix #6: Insert session separators based on time gaps
+    assistant_name = os.environ.get("ASSISTANT_NAME", "Nova")
     lines = [
         "[Conversation history from previous sessions]",
         "",
-        "IMPORTANT: This is a CONTINUING conversation. Do NOT greet the user again "
-        "(no 'Salut', 'Bonjour', etc.) — you already know each other. "
-        "Do NOT re-examine code or state you already checked in recent history. "
-        "Pick up naturally where the conversation left off.",
+        "",
+        "",
+        f"IMPORTANT: This is a CONTINUING conversation. Do NOT greet the user again "
+        f"(no 'Salut', 'Bonjour', etc.) — you already know each other. "
+        f"Do NOT re-examine code or state you already checked in recent history. "
+        f"Pick up naturally where the conversation left off.",
         "",
     ]
     prev_time = None
