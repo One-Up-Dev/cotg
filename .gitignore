@@ -1,7 +1,14 @@
+# Environment
 .env
 .venv/
 __pycache__/
 *.pyc
+
+# Data files
 database.db
+*.db
+database_backup.sql
+
+# Claude Code
 .claude/settings.json
 TASKS.md
